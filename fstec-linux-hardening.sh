@@ -428,26 +428,25 @@ section_2_3() {
         "! find /etc/cron* /var/spool/cron -type f -executable ! -user root 2>/dev/null | head -5 | grep -q ." \
         "find /etc/cron* /var/spool/cron -type f -executable ! -user root -exec chmod go-w {} \\; 2>/dev/null || true" \
         "Права на файлы cron"
-    
+
     # 2.3.4 - Аудит SUID/SGID приложений
     apply_or_test "2.3.4" \
-        "find / -xdev -type f -perm /6000 2>/dev/null | while read -r file; do \
-            if ! printf '%s\n' "${SUID_WHITELIST[@]}" | grep -q "^${file}$"; then
-
-                if [[ \$(stat -c '%U' \"\$file\") != \"root\" ]]; then \
-                    exit 1; \
-                fi; \
-            fi; \
-        done; true" \
-        "find / -xdev -type f -perm /6000 2>/dev/null | while read -r file; do \
-            if ! printf '%s\\n' \"${SUID_WHITELIST[@]}\" | grep -q \"^\\\${file}$\"; then \
-                if [[ \$(stat -c '%U' \"\$file\") != \"root\" ]]; then \
-                    chmod u-s,g-s \"\$file\" 2>/dev/null || true; \
-                    chown root:root \"\$file\" 2>/dev/null || true; \
-                fi; \
-            fi; \
-        done" \
-        "Аудит SUID/SGID приложений"
+    "! find / -xdev -type f -perm /6000 2>/dev/null | while read -r file; do \
+        for allowed in \"${SUID_WHITELIST[@]}\"; do \
+            [[ \"\$file\" == \"\$allowed\" ]] && continue 2; \
+        done; \
+        [[ \$(stat -c '%U' \"\$file\" 2>/dev/null) != \"root\" ]] && exit 1; \
+    done" \
+    "find / -xdev -type f -perm /6000 2>/dev/null | while read -r file; do \
+        for allowed in \"${SUID_WHITELIST[@]}\"; do \
+            [[ \"\$file\" == \"\$allowed\" ]] && continue 2; \
+        done; \
+        if [[ \$(stat -c '%U' \"\$file\" 2>/dev/null) != \"root\" ]]; then \
+            chmod u-s,g-s \"\$file\" 2>/dev/null || true; \
+            chown root:root \"\$file\" 2>/dev/null || true; \
+        fi; \
+    done" \
+    "Аудит SUID/SGID приложений"
     
     # 2.3.5 - Права на скрытые файлы в home
     apply_or_test "2.3.5" \
