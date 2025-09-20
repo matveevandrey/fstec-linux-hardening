@@ -21,6 +21,26 @@ BACKUP_DIR="/root/fstec-backup-$(date +%Y%m%d)"
 OS_IMPACT_LEVEL="all"  # all, safe, medium, dangerous
 RISK_LEVEL="all"       # all, low, medium, high, critical
 
+# Белый список SUID/SGID программ
+SUID_WHITELIST=(
+    "/usr/bin/sudo"
+    "/usr/bin/passwd"
+    "/usr/bin/chfn"
+    "/usr/bin/chsh"
+    "/usr/bin/newgrp"
+    "/bin/ping"
+    "/bin/mount"
+    "/bin/umount"
+    "/bin/su"
+    "/usr/bin/sudoedit"
+    "/usr/bin/ssh-agent"
+    "/usr/bin/expiry"
+    "/usr/bin/wall"
+    "/usr/bin/chage"
+    "/usr/bin/gpasswd"
+    "/usr/bin/crontab"
+)
+
 # Карта влияния на работу ОС для каждой настройки
 declare -A OS_IMPACT_MAP=(
     ["2.1.1"]="safe"       # Запрет пустых паролей
@@ -28,10 +48,13 @@ declare -A OS_IMPACT_MAP=(
     ["2.2.1"]="safe"       # Ограничение команды su
     ["2.2.2"]="safe"       # Настройка sudo для wheel
     ["2.3.1"]="safe"       # Права доступа к системным файлам
-    ["2.3.2"]="safe"       # Права на файлы cron
-    ["2.3.3"]="medium"     # Аудит SUID/SGID приложений
-    ["2.3.4"]="safe"       # Права на скрытые файлы в home
-    ["2.3.5"]="safe"       # Права на домашние директории
+    ["2.3.2"]="safe"       # Права на системные директории
+    ["2.3.3"]="safe"       # Права на файлы cron
+    ["2.3.4"]="medium"     # Аудит SUID/SGID приложений
+    ["2.3.5"]="safe"       # Права на скрытые файлы в home
+    ["2.3.6"]="safe"       # Права на домашние директории
+    ["2.3.7"]="safe"       # Права на rc.local/rc.d/systemd
+    ["2.3.8"]="safe"       # Ограничение at
     ["2.4.1"]="safe"       # kernel.dmesg_restrict
     ["2.4.2"]="safe"       # kernel.kptr_restrict
     ["2.4.3"]="safe"       # net.core.bpf_jit_harden
@@ -70,8 +93,11 @@ declare -A RISK_MAP=(
     ["2.3.1"]="high"       # Высокий риск при незакрытии
     ["2.3.2"]="medium"     # Средний риск при незакрытии
     ["2.3.3"]="medium"     # Средний риск при незакрытии
-    ["2.3.4"]="low"        # Низкий риск при незакрытии
-    ["2.3.5"]="medium"     # Средний риск при незакрытии
+    ["2.3.4"]="high"       # Высокий риск при незакрытии
+    ["2.3.5"]="low"        # Низкий риск при незакрытии
+    ["2.3.6"]="medium"     # Средний риск при незакрытии
+    ["2.3.7"]="low"        # Низкий риск при незакрытии
+    ["2.3.8"]="medium"     # Средний риск при незакрытии
     ["2.4.1"]="high"       # Высокий риск при незакрытии
     ["2.4.2"]="high"       # Высокий риск при незакрытии
     ["2.4.3"]="medium"     # Средний риск при незакрытии
@@ -128,6 +154,8 @@ if [[ -f /etc/os-release ]]; then
     
     # Определяем тип ОС
     if [[ "$OS_ID" == "alt" ]] || grep -qi "alt" /etc/os-release || grep -qi "alt" /etc/issue; then
+        OS_TYPE="alt"
+    elif [[ -f /etc/altlinux-release ]]; then
         OS_TYPE="alt"
     elif [[ "$OS_ID" == "debian" || "$OS_ID" == "ubuntu" ]]; then
         OS_TYPE="debian"
@@ -189,6 +217,9 @@ restart_service() {
     local service="$1"
     if [[ "$OS_TYPE" == "alt" ]]; then
         /sbin/service "$service" restart >> "$LOG_FILE" 2>&1
+    elif [[ "$OS_TYPE" == "debian" ]] && [[ "$service" == "sshd" ]]; then
+        # Для Debian/Ubuntu сервис SSH называется 'ssh', а не 'sshd'
+        systemctl restart "ssh" >> "$LOG_FILE" 2>&1
     else
         systemctl restart "$service" >> "$LOG_FILE" 2>&1
     fi
@@ -220,6 +251,33 @@ update_grub_config() {
             grub2-mkconfig -o /boot/grub2/grub.cfg >> "$LOG_FILE" 2>&1
         fi
     fi
+}
+
+# Идемпотентная запись в sysctl
+set_sysctl_kv() {
+    local file="$1" key="$2" val="$3"
+    if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null; then
+        sed -i "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = ${val}|" "$file"
+    else
+        echo "${key} = ${val}" >> "$file"
+    fi
+}
+
+# Безопасное добавление параметров ядра
+ensure_kernel_param() {
+    local file="$1" param="$2"
+    
+    # Убедимся, что GRUB_CMDLINE_LINUX существует
+    grep -qE '^GRUB_CMDLINE_LINUX=' "$file" || echo 'GRUB_CMDLINE_LINUX=""' >> "$file"
+    
+    # Обрабатываем оба возможных ключа
+    for key in GRUB_CMDLINE_LINUX GRUB_CMDLINE_LINUX_DEFAULT; do
+        if grep -q "^${key}=" "$file"; then
+            if ! grep -q "$param" "$file"; then
+                sed -i "s/^\(${key}=\"[^\"]*\)\"/\1 ${param}\"/" "$file"
+            fi
+        fi
+    done
 }
 
 # Универсальная функция проверки/применения
@@ -352,94 +410,76 @@ section_2_2() {
 ########## 2.3. Права доступа ##########
 section_2_3() {
     log "=== Секция 2.3: Права доступа к ФС ==="
+    
+    # 2.3.1 - Права доступа к системным файлам
     apply_or_test "2.3.1" \
         "[[ \$(stat -c '%a' /etc/passwd 2>/dev/null) == 644 ]] && [[ \$(stat -c '%a' /etc/group 2>/dev/null) == 644 ]] && [[ \$(stat -c '%a' /etc/shadow 2>/dev/null) =~ ^(0|640)$ ]]" \
         "chmod 644 /etc/passwd /etc/group 2>/dev/null || true; chmod 640 /etc/shadow 2>/dev/null || true; chown root:root /etc/passwd /etc/group /etc/shadow 2>/dev/null || true" \
         "Права доступа к /etc/passwd, /etc/group, /etc/shadow"
     
+    # 2.3.2 - Права на системные директории
     apply_or_test "2.3.2" \
+        "[[ \$(stat -c '%a' /etc 2>/dev/null) == 755 ]] && [[ \$(stat -c '%a' /bin 2>/dev/null) == 755 ]] && [[ \$(stat -c '%a' /sbin 2>/dev/null) == 755 ]] && [[ \$(stat -c '%a' /usr/bin 2>/dev/null) == 755 ]]" \
+        "chmod 755 /etc /bin /sbin /usr/bin 2>/dev/null || true; chown root:root /etc /bin /sbin /usr/bin 2>/dev/null || true" \
+        "Права на системные директории"
+    
+    # 2.3.3 - Права на файлы cron
+    apply_or_test "2.3.3" \
         "! find /etc/cron* /var/spool/cron -type f -executable ! -user root 2>/dev/null | head -5 | grep -q ." \
         "find /etc/cron* /var/spool/cron -type f -executable ! -user root -exec chmod go-w {} \\; 2>/dev/null || true" \
         "Права на файлы cron"
     
-    apply_or_test "2.3.3" \
-        "find / -xdev -type f -perm /6000 2>/dev/null | head -10 | xargs -I {} sh -c 'stat -c \"%a %U\" {} 2>/dev/null' | awk '\$1 ~ /[0-9][0-9][0-9][0-9]/ && \$2 != \"root\" {exit 1}' || true" \
-        "find / -xdev -type f -perm /6000 ! -user root -exec chmod go-w {} \\; 2>/dev/null || true" \
+    # 2.3.4 - Аудит SUID/SGID приложений
+    apply_or_test "2.3.4" \
+        "find / -xdev -type f -perm /6000 2>/dev/null | while read -r file; do \
+            if ! printf '%s\n' "${SUID_WHITELIST[@]}" | grep -q "^${file}$"; then
+
+                if [[ \$(stat -c '%U' \"\$file\") != \"root\" ]]; then \
+                    exit 1; \
+                fi; \
+            fi; \
+        done; true" \
+        "find / -xdev -type f -perm /6000 2>/dev/null | while read -r file; do \
+            if ! printf '%s\\n' \"${SUID_WHITELIST[@]}\" | grep -q \"^\\\${file}$\"; then \
+                if [[ \$(stat -c '%U' \"\$file\") != \"root\" ]]; then \
+                    chmod u-s,g-s \"\$file\" 2>/dev/null || true; \
+                    chown root:root \"\$file\" 2>/dev/null || true; \
+                fi; \
+            fi; \
+        done" \
         "Аудит SUID/SGID приложений"
     
-    apply_or_test "2.3.4" \
+    # 2.3.5 - Права на скрытые файлы в home
+    apply_or_test "2.3.5" \
         "! find /home -name '.bash_history' -o -name '.history' -o -name '.sh_history' -o -name '.bashrc' -o -name '.profile' -o -name '.rhosts' ! -perm 600 2>/dev/null | head -5 | grep -q ." \
         "find /home -name '.bash_history' -o -name '.history' -o -name '.sh_history' -o -name '.bashrc' -o -name '.profile' -o -name '.rhosts' -exec chmod go-rwx {} \\; 2>/dev/null || true" \
         "Права на скрытые файлы в home"
     
-    apply_or_test "2.3.5" \
+    # 2.3.6 - Права на домашние директории
+    apply_or_test "2.3.6" \
         "! find /home -maxdepth 1 -type d ! -perm 700 ! -user root 2>/dev/null | head -5 | grep -q ." \
         "find /home -maxdepth 1 -type d ! -perm 700 ! -user root -exec chmod 700 {} \\; 2>/dev/null || true" \
         "Права на домашние директории"
-}
-
-########## 2.4. Защита ядра ##########
-section_2_4() {
-    log "=== Секция 2.4: Усиление ядра ==="
-    local sysctl_file="/etc/sysctl.d/99-fstec-security.conf"
     
-    apply_or_test "2.4.1" "[[ \$(sysctl -n kernel.dmesg_restrict 2>/dev
-
-########## 2.1. Авторизация ##########
-section_2_1() {
-    log "=== Секция 2.1: Авторизация ==="
-    apply_or_test "2.1.1" \
-        "! awk -F: '\$2 == \"\" {print \$1}' /etc/shadow | grep -q ." \
-        "sed -i 's/nullok//g' /etc/pam.d/* && passwd -l \$(awk -F: '\$2 == \"\" {print \$1}' /etc/shadow) 2>/dev/null || true" \
-        "Запрет пустых паролей"
+    # 2.3.7 - Права на rc.local/rc.d/systemd
+    apply_or_test "2.3.7" \
+        "! { [[ -f /etc/rc.local ]] && [[ \$(stat -c '%a' /etc/rc.local 2>/dev/null) != 744 ]]; } && \
+         ! find /etc/rc*.d -type f -perm /022 2>/dev/null | head -5 | grep -q . && \
+         ! find /etc/systemd/system -type f -perm /022 2>/dev/null | head -5 | grep -q ." \
+        "chmod 744 /etc/rc.local 2>/dev/null || true; \
+         chmod -R go-w /etc/rc*.d 2>/dev/null || true; \
+         find /etc/systemd/system -type f -exec chmod go-w {} \\; 2>/dev/null || true" \
+        "Права на rc.local/rc*.d и systemd unit-файлы"
     
-    apply_or_test "2.1.2" \
-        "grep -q '^PermitRootLogin no' /etc/ssh/sshd_config" \
-        "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config && restart_service sshd" \
-        "Запрет root входа по SSH"
-}
-
-########## 2.2. Привилегии ##########
-section_2_2() {
-    log "=== Секция 2.2: Ограничение привилегий ==="
-    apply_or_test "2.2.1" \
-        "grep -q 'auth required pam_wheel.so' /etc/pam.d/su" \
-        "echo 'auth required pam_wheel.so use_uid' >> /etc/pam.d/su && (grep -q '^wheel:' /etc/group || echo 'wheel:x:10:root' >> /etc/group)" \
-        "Ограничение команды su"
-    
-    apply_or_test "2.2.2" \
-        "grep -q '^%wheel' /etc/sudoers" \
-        "echo '%wheel ALL=(ALL:ALL) ALL' >> /etc/sudoers" \
-        "Настройка sudo для wheel"
-}
-
-########## 2.3. Права доступа ##########
-section_2_3() {
-    log "=== Секция 2.3: Права доступа к ФС ==="
-    apply_or_test "2.3.1" \
-        "[[ \$(stat -c '%a' /etc/passwd 2>/dev/null) == 644 ]] && [[ \$(stat -c '%a' /etc/group 2>/dev/null) == 644 ]] && [[ \$(stat -c '%a' /etc/shadow 2>/dev/null) =~ ^(0|640)$ ]]" \
-        "chmod 644 /etc/passwd /etc/group 2>/dev/null || true; chmod 640 /etc/shadow 2>/dev/null || true; chown root:root /etc/passwd /etc/group /etc/shadow 2>/dev/null || true" \
-        "Права доступа к /etc/passwd, /etc/group, /etc/shadow"
-    
-    apply_or_test "2.3.2" \
-        "! find /etc/cron* /var/spool/cron -type f -executable ! -user root 2>/dev/null | head -5 | grep -q ." \
-        "find /etc/cron* /var/spool/cron -type f -executable ! -user root -exec chmod go-w {} \\; 2>/dev/null || true" \
-        "Права на файлы cron"
-    
-    apply_or_test "2.3.3" \
-        "find / -xdev -type f -perm /6000 2>/dev/null | head -10 | xargs -I {} sh -c 'stat -c \"%a %U\" {} 2>/dev/null' | awk '\$1 ~ /[0-9][0-9][0-9][0-9]/ && \$2 != \"root\" {exit 1}' || true" \
-        "find / -xdev -type f -perm /6000 ! -user root -exec chmod go-w {} \\; 2>/dev/null || true" \
-        "Аудит SUID/SGID приложений"
-    
-    apply_or_test "2.3.4" \
-        "! find /home -name '.bash_history' -o -name '.history' -o -name '.sh_history' -o -name '.bashrc' -o -name '.profile' -o -name '.rhosts' ! -perm 600 2>/dev/null | head -5 | grep -q ." \
-        "find /home -name '.bash_history' -o -name '.history' -o -name '.sh_history' -o -name '.bashrc' -o -name '.profile' -o -name '.rhosts' -exec chmod go-rwx {} \\; 2>/dev/null || true" \
-        "Права на скрытые файлы в home"
-    
-    apply_or_test "2.3.5" \
-        "! find /home -maxdepth 1 -type d ! -perm 700 ! -user root 2>/dev/null | head -5 | grep -q ." \
-        "find /home -maxdepth 1 -type d ! -perm 700 ! -user root -exec chmod 700 {} \\; 2>/dev/null || true" \
-        "Права на домашние директории"
+    # 2.3.8 - Ограничение at
+    apply_or_test "2.3.8" \
+        "! command -v at >/dev/null || { [[ -d /var/spool/at ]] && [[ \$(stat -c '%a' /var/spool/at 2>/dev/null) -le 700 ]]; }" \
+        "if command -v at >/dev/null; then \
+             chmod 700 /var/spool/at 2>/dev/null || true; \
+             chown root:root /var/spool/at 2>/dev/null || true; \
+             echo '*' > /etc/at.deny 2>/dev/null || true; \
+         fi" \
+        "Ограничение at (права и deny)"
 }
 
 ########## 2.4. Защита ядра ##########
@@ -448,13 +488,16 @@ section_2_4() {
     local sysctl_file="/etc/sysctl.d/99-fstec-security.conf"
     
     apply_or_test "2.4.1" "[[ \$(sysctl -n kernel.dmesg_restrict 2>/dev/null) == 1 ]]" \
-        "echo 'kernel.dmesg_restrict = 1' >> '$sysctl_file'" "kernel.dmesg_restrict = 1"
+        "set_sysctl_kv '$sysctl_file' 'kernel.dmesg_restrict' '1'" \
+        "kernel.dmesg_restrict = 1"
     
     apply_or_test "2.4.2" "[[ \$(sysctl -n kernel.kptr_restrict 2>/dev/null) == 2 ]]" \
-        "echo 'kernel.kptr_restrict = 2' >> '$sysctl_file'" "kernel.kptr_restrict = 2"
+        "set_sysctl_kv '$sysctl_file' 'kernel.kptr_restrict' '2'" \
+        "kernel.kptr_restrict = 2"
     
     apply_or_test "2.4.3" "[[ \$(sysctl -n net.core.bpf_jit_harden 2>/dev/null) == 2 ]]" \
-        "echo 'net.core.bpf_jit_harden = 2' >> '$sysctl_file'" "net.core.bpf_jit_harden = 2"
+        "set_sysctl_kv '$sysctl_file' 'net.core.bpf_jit_harden' '2'" \
+        "net.core.bpf_jit_harden = 2"
 }
 
 ########## 2.5. Уменьшение периметра атаки ##########
@@ -463,28 +506,36 @@ section_2_5() {
     local sysctl_file="/etc/sysctl.d/99-fstec-security.conf"
     
     apply_or_test "2.5.1" "[[ \$(sysctl -n kernel.perf_event_paranoid 2>/dev/null) == 3 ]]" \
-        "echo 'kernel.perf_event_paranoid = 3' >> '$sysctl_file'" "kernel.perf_event_paranoid = 3"
-    
+        "set_sysctl_kv '$sysctl_file' 'kernel.perf_event_paranoid' '3'" \
+        "kernel.perf_event_paranoid = 3"
+
     apply_or_test "2.5.2" "[[ \$(sysctl -n kernel.kexec_load_disabled 2>/dev/null) == 1 ]]" \
-        "echo 'kernel.kexec_load_disabled = 1' >> '$sysctl_file'" "kernel.kexec_load_disabled = 1"
+        "set_sysctl_kv '$sysctl_file' 'kernel.kexec_load_disabled' '1'" \
+        "kernel.kexec_load_disabled = 1"
     
     apply_or_test "2.5.3" "[[ \$(sysctl -n user.max_user_namespaces 2>/dev/null) == 0 ]]" \
-        "echo 'user.max_user_namespaces = 0' >> '$sysctl_file'" "user.max_user_namespaces = 0"
+        "set_sysctl_kv '$sysctl_file' 'user.max_user_namespaces' '0'" \
+        "user.max_user_namespaces = 0"
     
     apply_or_test "2.5.4" "[[ \$(sysctl -n kernel.unprivileged_bpf_disabled 2>/dev/null) == 1 ]]" \
-        "echo 'kernel.unprivileged_bpf_disabled = 1' >> '$sysctl_file'" "kernel.unprivileged_bpf_disabled = 1"
+        "set_sysctl_kv '$sysctl_file' 'kernel.unprivileged_bpf_disabled' '1'" \
+        "kernel.unprivileged_bpf_disabled = 1"
     
     apply_or_test "2.5.5" "[[ \$(sysctl -n vm.unprivileged_userfaultfd 2>/dev/null) == 0 ]]" \
-        "echo 'vm.unprivileged_userfaultfd = 0' >> '$sysctl_file'" "vm.unprivileged_userfaultfd = 0"
+        "set_sysctl_kv '$sysctl_file' 'vm.unprivileged_userfaultfd' '0'" \
+        "vm.unprivileged_userfaultfd = 0"
     
     apply_or_test "2.5.6" "[[ \$(sysctl -n dev.tty.ldisc_autoload 2>/dev/null) == 0 ]]" \
-        "echo 'dev.tty.ldisc_autoload = 0' >> '$sysctl_file'" "dev.tty.ldisc_autoload = 0"
+        "set_sysctl_kv '$sysctl_file' 'dev.tty.ldisc_autoload' '0'" \
+        "dev.tty.ldisc_autoload = 0"
     
     apply_or_test "2.5.7" "[[ \$(sysctl -n vm.mmap_min_addr 2>/dev/null) -ge 4096 ]]" \
-        "echo 'vm.mmap_min_addr = 65536' >> '$sysctl_file'" "vm.mmap_min_addr >= 4096"
+        "set_sysctl_kv '$sysctl_file' 'vm.mmap_min_addr' '65536'" \
+        "vm.mmap_min_addr >= 4096"
     
     apply_or_test "2.5.8" "[[ \$(sysctl -n kernel.randomize_va_space 2>/dev/null) == 2 ]]" \
-        "echo 'kernel.randomize_va_space = 2' >> '$sysctl_file'" "kernel.randomize_va_space = 2"
+        "set_sysctl_kv '$sysctl_file' 'kernel.randomize_va_space' '2'" \
+        "kernel.randomize_va_space = 2"
 }
 
 ########## 2.6. Пользовательское пространство ##########
@@ -493,22 +544,28 @@ section_2_6() {
     local sysctl_file="/etc/sysctl.d/99-fstec-security.conf"
     
     apply_or_test "2.6.1" "[[ \$(sysctl -n kernel.yama.ptrace_scope 2>/dev/null) == 3 ]]" \
-        "echo 'kernel.yama.ptrace_scope = 3' >> '$sysctl_file'" "kernel.yama.ptrace_scope = 3"
+        "set_sysctl_kv '$sysctl_file' 'kernel.yama.ptrace_scope' '3'" \
+        "kernel.yama.ptrace_scope = 3"
     
     apply_or_test "2.6.2" "[[ \$(sysctl -n fs.protected_symlinks 2>/dev/null) == 1 ]]" \
-        "echo 'fs.protected_symlinks = 1' >> '$sysctl_file'" "fs.protected_symlinks = 1"
+        "set_sysctl_kv '$sysctl_file' 'fs.protected_symlinks' '1'" \
+        "fs.protected_symlinks = 1"
     
     apply_or_test "2.6.3" "[[ \$(sysctl -n fs.protected_hardlinks 2>/dev/null) == 1 ]]" \
-        "echo 'fs.protected_hardlinks = 1' >> '$sysctl_file'" "fs.protected_hardlinks = 1"
+        "set_sysctl_kv '$sysctl_file' 'fs.protected_hardlinks' '1'" \
+        "fs.protected_hardlinks = 1"
     
     apply_or_test "2.6.4" "[[ \$(sysctl -n fs.protected_fifos 2>/dev/null) == 2 ]]" \
-        "echo 'fs.protected_fifos = 2' >> '$sysctl_file'" "fs.protected_fifos = 2"
+        "set_sysctl_kv '$sysctl_file' 'fs.protected_fifos' '2'" \
+        "fs.protected_fifos = 2"
     
     apply_or_test "2.6.5" "[[ \$(sysctl -n fs.protected_regular 2>/dev/null) == 2 ]]" \
-        "echo 'fs.protected_regular = 2' >> '$sysctl_file'" "fs.protected_regular = 2"
+        "set_sysctl_kv '$sysctl_file' 'fs.protected_regular' '2'" \
+        "fs.protected_regular = 2"
     
     apply_or_test "2.6.6" "[[ \$(sysctl -n fs.suid_dumpable 2>/dev/null) == 0 ]]" \
-        "echo 'fs.suid_dumpable = 0' >> '$sysctl_file'" "fs.suid_dumpable = 0"
+        "set_sysctl_kv '$sysctl_file' 'fs.suid_dumpable' '0'" \
+        "fs.suid_dumpable = 0"
 }
 
 ########## Параметры загрузки ядра ##########
@@ -527,45 +584,45 @@ configure_kernel_params() {
     fi
     
     apply_or_test "kernel.init_on_alloc" "grep -q 'init_on_alloc=1' /proc/cmdline" \
-        "if ! grep -q \"init_on_alloc=1\" \"$grub_file\"; then sed -i 's/GRUB_CMDLINE_LINUX=\"\\(.*\\)\"/GRUB_CMDLINE_LINUX=\"\\1 init_on_alloc=1\"/' \"$grub_file\"; fi" \
+        "ensure_kernel_param '$grub_file' 'init_on_alloc=1'" \
         "Параметр ядра: init_on_alloc=1"
     
     apply_or_test "kernel.slab_nomerge" "grep -q 'slab_nomerge' /proc/cmdline" \
-        "if ! grep -q \"slab_nomerge\" \"$grub_file\"; then sed -i 's/GRUB_CMDLINE_LINUX=\"\\(.*\\)\"/GRUB_CMDLINE_LINUX=\"\\1 slab_nomerge\"/' \"$grub_file\"; fi" \
+        "ensure_kernel_param '$grub_file' 'slab_nomerge'" \
         "Параметр ядра: slab_nomerge"
     
     apply_or_test "kernel.mitigations" "grep -q 'mitigations=auto,nosmt' /proc/cmdline" \
-        "if ! grep -q \"mitigations=auto,nosmt\" \"$grub_file\"; then sed -i 's/GRUB_CMDLINE_LINUX=\"\\(.*\\)\"/GRUB_CMDLINE_LINUX=\"\\1 mitigations=auto,nosmt\"/' \"$grub_file\"; fi" \
+        "ensure_kernel_param '$grub_file' 'mitigations=auto,nosmt'" \
         "Параметр ядра: mitigations=auto,nosmt"
     
     # Для не-Альт систем добавляем дополнительные параметры
     if [[ "$OS_TYPE" != "alt" ]]; then
         apply_or_test "kernel.iommu_force" "grep -q 'iommu=force' /proc/cmdline" \
-            "if ! grep -q \"iommu=force\" \"$grub_file\"; then sed -i 's/GRUB_CMDLINE_LINUX=\"\\(.*\\)\"/GRUB_CMDLINE_LINUX=\"\\1 iommu=force\"/' \"$grub_file\"; fi" \
+            "ensure_kernel_param '$grub_file' 'iommu=force'" \
             "Параметр ядра: iommu=force"
         
         apply_or_test "kernel.iommu_strict" "grep -q 'iommu.strict=1' /proc/cmdline" \
-            "if ! grep -q \"iommu.strict=1\" \"$grub_file\"; then sed -i 's/GRUB_CMDLINE_LINUX=\"\\(.*\\)\"/GRUB_CMDLINE_LINUX=\"\\1 iommu.strict=1\"/' \"$grub_file\"; fi" \
+            "ensure_kernel_param '$grub_file' 'iommu.strict=1'" \
             "Параметр ядра: iommu.strict=1"
         
         apply_or_test "kernel.iommu_passthrough" "grep -q 'iommu.passthrough=0' /proc/cmdline" \
-            "if ! grep -q \"iommu.passthrough=0\" \"$grub_file\"; then sed -i 's/GRUB_CMDLINE_LINUX=\"\\(.*\\)\"/GRUB_CMDLINE_LINUX=\"\\1 iommu.passthrough=0\"/' \"$grub_file\"; fi" \
+            "ensure_kernel_param '$grub_file' 'iommu.passthrough=0'" \
             "Параметр ядра: iommu.passthrough=0"
         
         apply_or_test "kernel.randomize_kstack_offset" "grep -q 'randomize_kstack_offset=1' /proc/cmdline" \
-            "if ! grep -q \"randomize_kstack_offset=1\" \"$grub_file\"; then sed -i 's/GRUB_CMDLINE_LINUX=\"\\(.*\\)\"/GRUB_CMDLINE_LINUX=\"\\1 randomize_kstack_offset=1\"/' \"$grub_file\"; fi" \
+            "ensure_kernel_param '$grub_file' 'randomize_kstack_offset=1'" \
             "Параметр ядра: randomize_kstack_offset=1"
         
         apply_or_test "kernel.vsyscall_none" "grep -q 'vsyscall=none' /proc/cmdline" \
-            "if ! grep -q \"vsyscall=none\" \"$grub_file\"; then sed -i 's/GRUB_CMDLINE_LINUX=\"\\(.*\\)\"/GRUB_CMDLINE_LINUX=\"\\1 vsyscall=none\"/' \"$grub_file\"; fi" \
+            "ensure_kernel_param '$grub_file' 'vsyscall=none'" \
             "Параметр ядра: vsyscall=none"
         
         apply_or_test "kernel.tsx_off" "grep -q 'tsx=off' /proc/cmdline" \
-            "if ! grep -q \"tsx=off\" \"$grub_file\"; then sed -i 's/GRUB_CMDLINE_LINUX=\"\\(.*\\)\"/GRUB_CMDLINE_LINUX=\"\\1 tsx=off\"/' \"$grub_file\"; fi" \
+            "ensure_kernel_param '$grub_file' 'tsx=off'" \
             "Параметр ядра: tsx=off"
         
         apply_or_test "kernel.debugfs_off" "grep -q 'debugfs=off' /proc/cmdline" \
-            "if ! grep -q \"debugfs=off\" \"$grub_file\"; then sed -i 's/GRUB_CMDLINE_LINUX=\"\\(.*\\)\"/GRUB_CMDLINE_LINUX=\"\\1 debugfs=off\"/' \"$grub_file\"; fi" \
+            "ensure_kernel_param '$grub_file' 'debugfs=off'" \
             "Параметр ядра: debugfs=off"
     fi
     
